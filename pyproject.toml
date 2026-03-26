@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "gpu-keepalive"
-version         = "0.1.1"
+version         = "0.1.2"
 description     = "自动维持 GPU SM 利用率守护进程，防止任务被强杀"
 readme          = "README.md"
 license         = "MIT"

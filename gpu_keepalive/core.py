@@ -26,33 +26,33 @@ import pynvml
 # ──────────────────────────────────────────────────────────────
 
 GPU_PROFILES = {
-    # name_keyword : (fp16_matrix_dim, sleep_base_ms)
-    "B200":    (16384, 0.15),
-    "B100":    (16384, 0.15),
-    "H100":    (8192,  0.20),
-    "H800":    (8192,  0.20),
-    "A100":    (8192,  0.30),
-    "A10G":    (4096,  0.50),
-    "A10":     (4096,  0.50),
-    "A30":     (4096,  0.50),
-    "A40":     (4096,  0.50),
-    "V100":    (4096,  0.50),
-    "4090":    (4096,  0.40),
-    "3090":    (4096,  0.50),
-    "DEFAULT": (2048,  0.80),
+    # name_keyword : fp16_matrix_dim
+    # sleep_ms 不再写死，启动时自动标定
+    "B200":    16384,
+    "B100":    16384,
+    "H100":    8192,
+    "H800":    8192,
+    "A100":    8192,
+    "A10G":    4096,
+    "A10":     4096,
+    "A30":     4096,
+    "A40":     4096,
+    "V100":    4096,
+    "4090":    4096,
+    "3090":    4096,
+    "DEFAULT": 2048,
 }
 
 
-def _detect_profile(gpu_index: int) -> tuple[str, int, float]:
+def _detect_profile(gpu_index: int) -> tuple[str, int]:
     handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
     name = pynvml.nvmlDeviceGetName(handle)
     if isinstance(name, bytes):
         name = name.decode()
-    for key, (dim, slp) in GPU_PROFILES.items():
+    for key, dim in GPU_PROFILES.items():
         if key != "DEFAULT" and key in name:
-            return name, dim, slp
-    dim, slp = GPU_PROFILES["DEFAULT"]
-    return name, dim, slp
+            return name, dim
+    return name, GPU_PROFILES["DEFAULT"]
 
 
 def _get_util(gpu_index: int) -> int:
@@ -65,9 +65,8 @@ def _get_util(gpu_index: int) -> int:
 # ──────────────────────────────────────────────────────────────
 
 class KeepaliveKernel:
-    def __init__(self, gpu_index: int, matrix_dim: int, sleep_ms: float):
+    def __init__(self, gpu_index: int, matrix_dim: int, target_util: int = 50):
         self.gpu_index = gpu_index
-        self._sleep_ms = sleep_ms
         self._enabled  = False
         self._lock     = threading.Lock()
 
@@ -75,9 +74,31 @@ class KeepaliveKernel:
         self._a  = torch.randn(matrix_dim, matrix_dim, dtype=torch.float16, device=device)
         self._b  = torch.randn(matrix_dim, matrix_dim, dtype=torch.float16, device=device)
 
+        # 标定：实测 mm() 耗时，反推达到目标利用率所需的 sleep
+        self._sleep_ms_init = self._calibrate(device, target_util)
+        self._sleep_ms = self._sleep_ms_init
+
         t = threading.Thread(target=self._loop, daemon=True,
                              name=f"keepalive-gpu{gpu_index}")
         t.start()
+
+    def _calibrate(self, device: torch.device, target_util: int,
+                   n: int = 20) -> float:
+        """实测一次 mm() 耗时，计算 duty cycle = target_util% 所需的 sleep_ms。"""
+        for _ in range(5):  # warmup
+            torch.mm(self._a, self._b)
+        torch.cuda.synchronize(device)
+
+        t0 = time.perf_counter()
+        for _ in range(n):
+            torch.mm(self._a, self._b)
+        torch.cuda.synchronize(device)
+        compute_ms = (time.perf_counter() - t0) / n * 1000
+
+        # duty = compute / (compute + sleep) = target/100
+        # => sleep = compute * (100 - target) / target
+        sleep_ms = compute_ms * (100 - target_util) / target_util
+        return max(0.05, sleep_ms)
 
     def start(self):
         with self._lock:
@@ -86,10 +107,11 @@ class KeepaliveKernel:
     def stop(self):
         with self._lock:
             self._enabled = False
+            self._sleep_ms = self._sleep_ms_init  # 重置，下次启动从标定值开始
 
     def set_sleep(self, ms: float):
         with self._lock:
-            self._sleep_ms = max(0.01, ms)
+            self._sleep_ms = max(0.05, ms)
 
     def _loop(self):
         torch.cuda.set_device(self.gpu_index)
@@ -109,7 +131,11 @@ class KeepaliveKernel:
 # 单卡状态（PI 控制器参数独立）
 # ──────────────────────────────────────────────────────────────
 
-_DEAD_BAND = 3   # 误差在 ±3% 以内时不调整，避免持续抖动
+_DEAD_BAND  = 3   # 误差在 ±3% 以内时不调整，避免持续抖动
+_STOP_BAND  = 20  # keepalive 运行时，SM > target+STOP_BAND 才认为是真实负载，停止让路
+
+
+_WARMUP_TICKS = 3  # 启动后跳过头几个采样周期，等 NVML 数据稳定再开始 PID 调节
 
 
 @dataclass
@@ -122,9 +148,10 @@ class GpuState:
     integral:     float = 0.0
     prev_error:   float = 0.0
     tick:         int   = 0
-    KP:           float = 0.03   # 降低：减少过冲
-    KI:           float = 0.005  # 降低：慢速积分
-    KD:           float = 0.02   # 新增：微分项，抑制震荡
+    warmup_ticks: int   = 0      # 剩余预热周期，>0 时不做 PID 调节
+    KP:           float = 0.05   # 比例项：适当加快收敛
+    KI:           float = 0.005  # 积分项：慢速消除稳态误差
+    KD:           float = 0.02   # 微分项：抑制震荡
     util_history: deque = field(default_factory=lambda: deque(maxlen=4))
 
 
@@ -141,7 +168,7 @@ def _adjust(s: GpuState, util: int, target: int):
 
     derivative = error - s.prev_error
     s.integral  = max(-20, min(20, s.integral + error))  # 收紧限幅
-    s.sleep_ms  = max(0.01, s.sleep_ms + s.KP * error + s.KI * s.integral + s.KD * derivative)
+    s.sleep_ms  = max(0.05, s.sleep_ms + s.KP * error + s.KI * s.integral + s.KD * derivative)
     s.prev_error = error
     s.kernel.set_sleep(s.sleep_ms)
 
@@ -162,15 +189,17 @@ class MultiGpuController:
 
         pynvml.nvmlInit()
 
-        print(f"[keepalive] 检测到 {len(gpu_indices)} 张待守护 GPU，逐一初始化…\n")
+        print(f"[keepalive] 检测到 {len(gpu_indices)} 张待守护 GPU，逐一初始化并标定…\n")
         for idx in gpu_indices:
-            name, dim, slp = _detect_profile(idx)
-            kernel  = KeepaliveKernel(idx, dim, slp)
+            name, dim = _detect_profile(idx)
+            print(f"  GPU {idx}: {name}  标定中…", flush=True)
+            kernel  = KeepaliveKernel(idx, dim, target_util)
+            slp     = kernel._sleep_ms
             mem_mb  = 2 * dim * dim * 2 / 1024 ** 2
             tag     = next((k for k in GPU_PROFILES if k != "DEFAULT" and k in name), "DEFAULT")
             print(f"  GPU {idx}: {name}")
             print(f"           配置={tag}  矩阵={dim}x{dim}  "
-                  f"sleep_base={slp}ms  显存占用≈{mem_mb:.0f} MB×2")
+                  f"sleep_calibrated={slp:.2f}ms  显存占用≈{mem_mb:.0f} MB×2")
             self.states.append(
                 GpuState(gpu_index=idx, name=name, kernel=kernel, sleep_ms=slp)
             )
@@ -179,6 +208,8 @@ class MultiGpuController:
     # ── 单步轮询 ─────────────────────────────
 
     def _step(self):
+        stop_threshold = self.target_util + _STOP_BAND
+
         for s in self.states:
             try:
                 util = _get_util(s.gpu_index)
@@ -186,21 +217,31 @@ class MultiGpuController:
                 print(f"[keepalive] GPU {s.gpu_index} 查询失败: {e}")
                 continue
 
-            if util < self.min_util:
-                if not s.active:
+            if s.active:
+                if util > stop_threshold:
+                    # SM 远超目标，说明真实负载已到，停止占位让路
+                    print(f"[keepalive] GPU {s.gpu_index} | SM={util:3d}% > {stop_threshold}%"
+                          f"  → 检测到真实负载，停止占位")
+                    s.kernel.stop()
+                    s.active = False
+                    s.integral = 0.0
+                    s.sleep_ms = s.kernel._sleep_ms_init
+                    s.util_history.clear()
+                elif s.warmup_ticks > 0:
+                    # 预热期：等 NVML 数据稳定，不做 PID 调节
+                    s.warmup_ticks -= 1
+                else:
+                    # 持续用 PID 调节趋近 target（无论高于还是低于 target）
+                    _adjust(s, util, self.target_util)
+            else:
+                if util < self.min_util:
                     print(f"[keepalive] GPU {s.gpu_index} | SM={util:3d}% < {self.min_util}%"
                           f"  → 启动占位")
                     s.kernel.start()
-                    s.active   = True
-                    s.integral = 0.0
-                else:
-                    _adjust(s, util, self.target_util)
-            else:
-                if s.active:
-                    print(f"[keepalive] GPU {s.gpu_index} | SM={util:3d}% ≥ {self.min_util}%"
-                          f"  → 停止占位，让路")
-                    s.kernel.stop()
-                    s.active = False
+                    s.active       = True
+                    s.integral     = 0.0
+                    s.warmup_ticks = _WARMUP_TICKS
+                    s.util_history.clear()
             s.tick += 1
 
         # 每 10 拍打印汇总表
