@@ -1,0 +1,23 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "gpu-keepalive"
+version         = "0.1.0"
+description     = "自动维持 GPU SM 利用率守护进程，防止任务被强杀"
+readme          = "README.md"
+license         = "MIT"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch>=2.0",
+    "pynvml>=11.0",
+]
+
+[project.scripts]
+gpu_keepalive = "gpu_keepalive.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gpu_keepalive*"]
