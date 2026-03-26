@@ -15,7 +15,8 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 import torch
 import pynvml
@@ -108,23 +109,40 @@ class KeepaliveKernel:
 # 单卡状态（PI 控制器参数独立）
 # ──────────────────────────────────────────────────────────────
 
+_DEAD_BAND = 3   # 误差在 ±3% 以内时不调整，避免持续抖动
+
+
 @dataclass
 class GpuState:
-    gpu_index: int
-    name:      str
-    kernel:    KeepaliveKernel
-    sleep_ms:  float
-    active:    bool  = False
-    integral:  float = 0.0
-    tick:      int   = 0
-    KP:        float = 0.05
-    KI:        float = 0.01
+    gpu_index:    int
+    name:         str
+    kernel:       KeepaliveKernel
+    sleep_ms:     float
+    active:       bool  = False
+    integral:     float = 0.0
+    prev_error:   float = 0.0
+    tick:         int   = 0
+    KP:           float = 0.03   # 降低：减少过冲
+    KI:           float = 0.005  # 降低：慢速积分
+    KD:           float = 0.02   # 新增：微分项，抑制震荡
+    util_history: deque = field(default_factory=lambda: deque(maxlen=4))
 
 
 def _adjust(s: GpuState, util: int, target: int):
-    error      = util - target
-    s.integral = max(-50, min(50, s.integral + error))
-    s.sleep_ms = max(0.01, s.sleep_ms + s.KP * error + s.KI * s.integral)
+    # 滑动平均消除 NVML 采样噪声
+    s.util_history.append(util)
+    smooth = sum(s.util_history) / len(s.util_history)
+
+    error = smooth - target
+    # 死区：误差很小时不调整，防止持续抖手
+    if abs(error) < _DEAD_BAND:
+        s.prev_error = error
+        return
+
+    derivative = error - s.prev_error
+    s.integral  = max(-20, min(20, s.integral + error))  # 收紧限幅
+    s.sleep_ms  = max(0.01, s.sleep_ms + s.KP * error + s.KI * s.integral + s.KD * derivative)
+    s.prev_error = error
     s.kernel.set_sleep(s.sleep_ms)
 
 
